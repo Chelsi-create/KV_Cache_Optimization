@@ -109,6 +109,80 @@ def concatenate_chunk_kv_caches(gpu_chunks: Dict[int, Any], selected_chunks: Lis
     
     return tuple(combined_kv)
 
+def _compute_chunk_boundaries_from_kv_lengths(
+    gpu_chunks: Dict[int, Any], selected_chunks: List[int]
+) -> List[tuple]:
+    """
+    Compute (start, end) token boundaries for each selected chunk when their
+    per-chunk KV caches are concatenated along the sequence dimension.
+    """
+    boundaries: List[tuple] = []
+    current = 0
+    for chunk_idx in selected_chunks:
+        if chunk_idx not in gpu_chunks:
+            continue
+        kv_cache = gpu_chunks[chunk_idx]
+        try:
+            key_tensor = kv_cache[0][0]
+            chunk_len = int(key_tensor.shape[2])
+        except Exception:
+            chunk_len = 0
+        start = current
+        end = current + chunk_len
+        boundaries.append((start, end))
+        current = end
+    return boundaries
+
+def create_sparse_kv_cache_from_chunks(full_kv_cache, chunk_boundaries, decode_chunk_indices, prefill_chunk_indices):
+    if not decode_chunk_indices:
+        return full_kv_cache
+    
+    # Calculate which token positions to keep based on chunk boundaries
+    keep_positions = []
+    for decode_chunk_idx in decode_chunk_indices:
+        if decode_chunk_idx < len(chunk_boundaries):
+            start, end = chunk_boundaries[decode_chunk_idx]
+            keep_positions.extend(range(start, end))
+    
+    if not keep_positions:
+        return full_kv_cache
+    
+    # Sort positions to maintain order
+    keep_positions = sorted(keep_positions)
+    
+    # Create sparse KV cache by selecting only the keep positions
+    # CRITICAL: We keep the original positions to preserve RoPE encoding
+    sparse_kv_cache = []
+    for layer_idx, layer_kv in enumerate(full_kv_cache):
+        keys, values = layer_kv
+        
+        # Check if keep_positions are within bounds
+        max_seq_len = values.shape[2]
+        invalid_positions = [pos for pos in keep_positions if pos >= max_seq_len]
+        if invalid_positions:
+            # Filter out invalid positions
+            keep_positions = [pos for pos in keep_positions if pos < max_seq_len]
+        
+        if not keep_positions:
+            return full_kv_cache
+        
+        # Select only the positions we want to keep
+        sparse_keys = keys[:, :, keep_positions, :]
+        sparse_values = values[:, :, keep_positions, :]
+        sparse_kv_cache.append((sparse_keys, sparse_values))
+    
+    # Return the same type as the original cache to maintain compatibility
+    if hasattr(full_kv_cache, '__class__'):
+        # Try to create the same type of object
+        try:
+            return full_kv_cache.__class__(sparse_kv_cache)
+        except:
+            # Fallback to tuple if we can't recreate the original type
+            return tuple(sparse_kv_cache)
+    else:
+        return tuple(sparse_kv_cache)
+
+
 def generate_with_kv_optimization(
     sample: Dict[str, Any],
     gpu_chunks: Dict[int, Any],
@@ -119,14 +193,7 @@ def generate_with_kv_optimization(
     device: str,
     max_tokens: int = 20
 ) -> Dict[str, Any]:
-    """
-    FIXED: Generate with dynamic KV cache updates from scheduler
-    
-    Key Fixes:
-    1. Rebuilds combined KV cache after scheduler updates
-    2. Properly handles GPU chunk changes during generation
-    3. Updates rewards based on actual generation quality
-    """
+
     # Metrics timers
     start_time = time.perf_counter()
     first_token_time: Optional[float] = None
@@ -150,7 +217,7 @@ def generate_with_kv_optimization(
     
     print("\\n=== STEP 2: BUILD INITIAL COMBINED KV CACHE ===")
     
-    # Build initial combined KV cache
+    # Build initial combined KV cache (no sparse pruning before first token)
     combined_kv = concatenate_chunk_kv_caches(gpu_chunks, initial_chunks)
     
     if combined_kv is None:
@@ -231,6 +298,7 @@ def generate_with_kv_optimization(
             print(f"[Trace] T{step} predicted: {predicted_chunks}")
             
             # STEP 5B: Check if heavy scheduler should run
+            print("Scheduler finally running")
             should_reschedule = scheduler.current_step % scheduler.get_scheduler_interval() == 0
             
             # Start per-token timer (includes scheduling overhead and model forward)
@@ -254,19 +322,40 @@ def generate_with_kv_optimization(
                         new_combined_kv = concatenate_chunk_kv_caches(updated_gpu_chunks, new_gpu_order)
                         
                         if new_combined_kv is not None:
-                            # CRITICAL: Update the KV cache used for generation
-                            combined_kv = new_combined_kv
-                            chunk_seq_len = combined_kv[0][0].shape[2]
+                            # Apply sparse pruning using predicted chunks while preserving positions
+                            full_len = new_combined_kv[0][0].shape[2]
+                            try:
+                                boundaries = _compute_chunk_boundaries_from_kv_lengths(updated_gpu_chunks, new_gpu_order)
+                                decode_set = set(predicted_chunks) if predicted_chunks else set(new_gpu_order)
+                                decode_indices = [ci for ci in new_gpu_order if ci in decode_set]
+                                if not decode_indices:
+                                    decode_indices = new_gpu_order
+                                pruned_kv = create_sparse_kv_cache_from_chunks(
+                                    new_combined_kv,
+                                    boundaries,
+                                    decode_indices,
+                                    new_gpu_order,
+                                )
+                                combined_kv = pruned_kv
+                                pruned_len = combined_kv[0][0].shape[2]
+                            except Exception as e:
+                                print(f"Sparse pruning failed, using full KV. Error: {e}")
+                                combined_kv = new_combined_kv
+                                pruned_len = combined_kv[0][0].shape[2]
+
+                            # Keep rope base on full_len even if pruned
+                            chunk_seq_len = full_len
                             current_gpu_chunks = new_gpu_order
                             
-                            print(f"Rebuilt combined KV cache, new sequence length: {chunk_seq_len}")
+                            print(f"Rebuilt combined KV cache, full seq len: {full_len}, pruned len: {pruned_len}")
                             
                             # FIXED: Update past_key_values to use new combined cache
                             # This is crucial - we need to restart the attention from the new combined cache
                             
                             # Prepare question input again for the new context
-                            new_total_context = chunk_seq_len + question_length
-                            attention_mask = torch.ones(1, new_total_context, device=device)
+                            # Attention mask must reflect pruned cache length + question tokens
+                            new_total_context_mask = pruned_len + question_length
+                            attention_mask = torch.ones(1, new_total_context_mask, device=device)
                             position_ids = torch.arange(chunk_seq_len, chunk_seq_len + question_length, device=device).unsqueeze(0)
                             
                             # Re-process question with new combined KV cache (wrap as DynamicCache)
@@ -423,15 +512,6 @@ def run_pipeline(
     max_tokens: int = 20,
     device: str = "cuda:0"
 ):
-    """
-    Main pipeline execution
-    
-    Steps:
-    1. Load dataset and setup retrieval
-    2. Build KV caches for chunks
-    3. For each sample: generate with KV optimization
-    4. Save results
-    """
     
     logger = setup_logging()
     os.makedirs(output_dir, exist_ok=True)
