@@ -22,8 +22,8 @@ import numpy as np
 import math
 
 # Local imports
-from rag_retrieval import RetrievalConfig, ColbertRetrieval
-from build_kv_v2 import build_chunk_kv_caches, QUERY_PROMPT
+# from rag_retrieval import RetrievalConfig, ColbertRetrieval
+from build_kv_v2 import build_chunk_kv_caches, QUERY_PROMPT, extract_texts
 from scheduler_v5 import AsyncPrefetchScheduler, FastKVCacheManager
 
 def convert_to_serializable(obj):
@@ -238,14 +238,6 @@ def async_generate_with_kv(
     max_tokens: int = 32,
     sparsity_ratio: float = 1.0  # Default to full attention
 ) -> Dict[str, Any]:
-    """
-    ASYNC PREFETCH generation function with true background chunk transfers
-    Key improvements:
-    - Background prefetch overlaps with generation
-    - Non-blocking transfer completion checks
-    - Pointer swapping instead of cache rebuilding
-    - Maintains all original functionality
-    """
     
     print(f"\n{'='*80}")
     print(f"[AsyncGeneration] Starting ASYNC PREFETCH generation")
@@ -657,23 +649,26 @@ def run_async_pipeline(
     top_k: int = 5,
     max_tokens: int = 32,
     device: str = "cuda:0",
-    sparsity_ratio: float = 1.0  # Default to full attention for quality
+    sparsity_ratio: float = 1.0,
+    gpu_memory_limit_gb: float = 40.0,
+
 ):
-    """
-    ASYNC PREFETCH pipeline with true background chunk transfers
-    Key improvements over v4:
-    - True background prefetch overlaps with generation
-    - Non-blocking transfer completion checks
-    - Reduced TTFT and TPOT through async operations
-    """
-    
-    print(f"\n{'='*80}")
-    print(f"[AsyncPipeline] Starting ASYNC PREFETCH Pipeline v6")
-    print(f"[AsyncPipeline] - True background prefetch with CUDA streams")
-    print(f"[AsyncPipeline] - Non-blocking transfer completion checks")
-    print(f"[AsyncPipeline] - Optimized for reduced TTFT/TPOT")
     print(f"[AsyncPipeline] Sparsity ratio: {sparsity_ratio:.2f}")
     print(f"{'='*80}\n")
+
+    if gpu_memory_limit_gb is not None:
+        import torch
+        device_id = int(device.split(":")[-1]) if ":" in device else 0
+        
+        total_mem = torch.cuda.get_device_properties(device_id).total_memory / (1024**3)
+        memory_fraction = gpu_memory_limit_gb / total_mem
+        
+        if memory_fraction > 1.0:
+            print(f"Warning: Requested {gpu_memory_limit_gb}GB > Available {total_mem:.1f}GB")
+            memory_fraction = 1.0
+        
+        torch.cuda.set_per_process_memory_fraction(memory_fraction, device=device_id)
+        print(f"GPU Memory Limited: {gpu_memory_limit_gb}GB / {total_mem:.1f}GB ({memory_fraction*100:.1f}%)")
 
     logger = setup_logging("WARNING")
     os.makedirs(output_dir, exist_ok=True)
@@ -682,10 +677,10 @@ def run_async_pipeline(
     samples = load_samples(input_file)
     print(f"[AsyncPipeline] Loaded {len(samples)} samples")
 
-    # Setup retrieval
-    retrieval_config = RetrievalConfig()
-    retriever = ColbertRetrieval(retrieval_config)
-    print(f"[AsyncPipeline] Retrieval system initialized")
+    # # Setup retrieval
+    # retrieval_config = RetrievalConfig()
+    # retriever = ColbertRetrieval(retrieval_config)
+    # print(f"[AsyncPipeline] Retrieval system initialized")
 
     # Load model/tokenizer
     print(f"[AsyncPipeline] Loading model...")
@@ -708,7 +703,7 @@ def run_async_pipeline(
             print(f"\n[Sample {si}] Processing with async prefetch...")
             scheduler = AsyncPrefetchScheduler(
                 device=device,
-                scheduler_interval=10,  # Check for swaps every 10 steps
+                scheduler_interval=3,  # Check for swaps every 10 steps
                 promote_per_step=2,     # Prefetch 2 chunks at a time (more aggressive)
                 exploration_c=1.2,
                 max_candidates=8,
@@ -719,10 +714,18 @@ def run_async_pipeline(
 
             torch.cuda.empty_cache()
 
-            # Retrieval (outside timing)
-            prepared_samples = retriever.prepare([sample])
-            retrieved_samples = retriever.retrieve(prepared_samples, top_k=top_k)
-            sample = retrieved_samples[0] if retrieved_samples else sample
+            # # Retrieval (outside timing)
+            # prepared_samples = retriever.prepare([sample])
+            # retrieved_samples = retriever.retrieve(prepared_samples, top_k=top_k)
+            # sample = retrieved_samples[0] if retrieved_samples else sample
+
+            all_texts = extract_texts(sample)
+            num_chunks = min(top_k, len(all_texts))
+            sample["retrieved_indices"] = list(range(num_chunks))
+
+            print(f"AsyncPipeline: Using first {num_chunks} chunks (no retrieval)")
+            print(f"AsyncPipeline: Total chunks available: {len(all_texts)}")
+
 
             # Build KV caches (outside timing)
             kv_result = build_chunk_kv_caches(
@@ -731,7 +734,8 @@ def run_async_pipeline(
                 top_k=top_k,
                 device=device,
                 provided_tokenizer=tokenizer,
-                provided_model=model
+                provided_model=model,
+                dataset_name="passkey"
             )
 
             gpu_chunks = kv_result.get("gpu_chunks", {})
@@ -776,7 +780,7 @@ def run_async_pipeline(
             print(f"[Sample {si}] Cache swaps: {transfer_count}")
             print(f"[Sample {si}] ASYNC TTFT: {ttft_ms:.1f}ms | TPOT: {tpot_ms:.1f}ms")
             print(f"[Sample {si}] Compression: {compression:.1%}")
-            print(f"[Sample {si}] Answer: {answer[:100]}...")
+            print(f"[Sample {si}] {answer[:100]}")
 
             # Clean shutdown
             scheduler.shutdown()
@@ -788,7 +792,7 @@ def run_async_pipeline(
             continue
 
     # Save results
-    output_path = os.path.join(output_dir, f"results_async_v6.json")
+    output_path = os.path.join(output_dir, f"results.json")
     with open(output_path, "w") as f:
         serializable_results = convert_to_serializable({"results": results})
         json.dump(serializable_results, f, indent=2)
@@ -847,7 +851,7 @@ def run_async_pipeline(
 def main():
     """Main function with async prefetch"""
     import argparse
-    parser = argparse.ArgumentParser("ASYNC PREFETCH RAG Pipeline v6")
+    parser = argparse.ArgumentParser("ASYNC PREFETCH RAG Pipeline v5")
     parser.add_argument("--input", default="/nfs/hpc/share/jainc/SemCache/baselines/CacheBlend/inputs/musique_s.json", help="Input dataset JSON")
     parser.add_argument("--output_dir", default="results_async_v6", help="Output directory")
     parser.add_argument("--model_id", default="mistralai/Mistral-7B-Instruct-v0.2", help="Model ID")
@@ -855,17 +859,9 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=20, help="Max generation length")
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--sparsity_ratio", type=float, default=1.0, help="Sparsity ratio")
+    parser.add_argument("--gpu-memory-limit", type=float, default=40.0, help="GPU memory limit in GB (default: 40)")
 
     args = parser.parse_args()
-
-    print("ASYNC PREFETCH RAG PIPELINE v6")
-    print("=" * 60)
-    print("Features:")
-    print("- True background prefetch with CUDA streams")
-    print("- Non-blocking transfer completion checks")
-    print("- Pointer swapping instead of cache rebuilding")
-    print("- Optimized for reduced TTFT/TPOT")
-    print("=" * 60)
 
     run_async_pipeline(
         input_file=args.input,
@@ -874,7 +870,8 @@ def main():
         top_k=args.top_k,
         max_tokens=args.max_tokens,
         device=args.device,
-        sparsity_ratio=args.sparsity_ratio
+        sparsity_ratio=args.sparsity_ratio,
+        gpu_memory_limit_gb=args.gpu_memory_limit
     )
 
 if __name__ == "__main__":

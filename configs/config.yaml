@@ -14,7 +14,7 @@ retrieval:
   question_key: question
   retrieved_key: retrieved_indices
   page_id_key: page_ids
-  top_k: 10                 # top-k retrieval per sample
+  top_k: 5                # top-k retrieval per sample
 
 # -------- Prefill Mode --------
 # Choose ONE of: full_kv_reuse | cb_fuse | recompute

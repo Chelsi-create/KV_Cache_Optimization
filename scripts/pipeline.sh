@@ -19,11 +19,11 @@ mkdir -p "results/pipeline_v5_results_new/musique"
 #!/usr/bin/env bash
 
 python3 src/pipeline_v5.py \
-    --input inputs/musique_s.json \
-    --output_dir results/pipeline_v5_results_new/musique/full \
+    --input data/infinitebench_musique/passkey_musique.json \
+    --output_dir results/pipeline_v5_results_new/passkey/full \
     --model_id mistralai/Mistral-7B-Instruct-v0.2 \
-    --top_k 5 \
-    --max_tokens 32 \
+    --top_k 30 \
+    --max_tokens 10 \
     --device cuda:0 \
     --sparsity_ratio 1.0
 
