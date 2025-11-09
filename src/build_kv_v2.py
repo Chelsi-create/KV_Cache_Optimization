@@ -8,28 +8,31 @@ from typing import Dict, List, Tuple, Any, Optional
 # ----------------------- Prompt Structure -----------------------
 
 # Default/Generic Prompt
-PREFIX_PROMPT = """Below are passages followed by a question. Answer with ONLY 2-5 words. Output the answer directly with no prefix, no explanation, no repetition. Stop immediately after giving the answer.
+PREFIX_PROMPT = """Below are passages followed by a question. Answer concisely with only the exact answer span from the passages. Output the answer directly with no prefix, no explanation, no repetition. If the answer is not present in the passages, output 'Not found'. Stop immediately after giving the answer.
 
 Passages:
 
 """
 
 QUERY_PROMPT = "\n\nQuestion: "
-ANSWER_FORMAT_PROMPT = "\nAnswer (2-5 words only):"
+ANSWER_FORMAT_PROMPT = "\nAnswer (exact text; 'Not found' if absent):"
 
 # === InfiniteBench Subset-Specific Prompts ===
 
 # 1. PassKey Task
 PASSKEY_PREFIX = """Below are passages containing a hidden pass key.
-Find and return ONLY the 5-digit pass key number.
-Output the number directly with no text. Strictly the number only, no other text. If there no pass key, output "No pass key".
+Answer concisely with only the exact answer span from the passages.
+- Return ONLY the 5-digit pass key number (digits only, no spaces, no text).
+- Do NOT guess or fabricate any number.
+- If no 5-digit pass key is present in the passages, output exactly 'Not found'.
+Stop immediately after giving the number.
 
 Passages:
 
 """
 
 PASSKEY_QUERY = "\n\nWhat is the pass key?"
-PASSKEY_ANSWER_FORMAT = "\nPass key:"
+PASSKEY_ANSWER_FORMAT = "\nAnswer (5 digits only; 'Not found' if absent):"
 
 # 2. KV Retrieval Task
 KV_RETRIEVAL_PREFIX = """Below are passages containing key-value pairs.
@@ -151,17 +154,14 @@ def build_chunk_sequence(
 ) -> List[int]:
     """
     Build sequence for individual chunk KV cache generation
-    Format: [prefix_prompt] + [chunk_text]
+    Format: [chunk_text] only (no full prefix). This matches full-sequence doc formatting.
     """
     # Tokenize components (remove BOS)
     chunk_ids = tokenizer.encode(chunk_text)[1:]
     
-    # Mistral chat format
-    s_start_full = [733, 16289, 28793] + tokenizer.encode(prefix_prompt)[1:]
+    # Use the same doc-chunk formatting as in build_sequence (no full prefix per chunk)
     s_start = []
-    
-    # Build sequence: prefix + chunk
-    sequence = s_start_full + s_start + chunk_ids
+    sequence = s_start + chunk_ids
     
     return sequence
 

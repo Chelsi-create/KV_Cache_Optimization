@@ -23,7 +23,7 @@ import math
 
 # Local imports
 # from rag_retrieval import RetrievalConfig, ColbertRetrieval
-from build_kv_v2 import build_chunk_kv_caches, QUERY_PROMPT, extract_texts
+from build_kv_v2 import build_chunk_kv_caches, QUERY_PROMPT, ANSWER_FORMAT_PROMPT, extract_texts, get_prompt_for_dataset
 from scheduler_v5 import AsyncPrefetchScheduler, FastKVCacheManager
 
 def convert_to_serializable(obj):
@@ -236,7 +236,11 @@ def async_generate_with_kv(
     tokenizer: Any,
     device: str,
     max_tokens: int = 32,
-    sparsity_ratio: float = 1.0  # Default to full attention
+    sparsity_ratio: float = 1.0,  # Default to full attention
+    disable_swaps: bool = False,
+    initial_force_chunk: Optional[int] = None,
+    prefetch_warmup_steps: int = 0,
+    dataset_name: Optional[str] = None
 ) -> Dict[str, Any]:
     
     print(f"\n{'='*80}")
@@ -254,6 +258,32 @@ def async_generate_with_kv(
 
     # Use initial GPU chunks
     current_gpu_chunks = list(gpu_chunks.keys())
+    # Optional: Force a specific chunk into initial GPU set for testing
+    if initial_force_chunk is not None:
+        forced_idx = int(initial_force_chunk)
+        try:
+            # If it's already on GPU, move it to front
+            if forced_idx in gpu_chunks:
+                current_gpu_chunks = [forced_idx] + [c for c in current_gpu_chunks if c != forced_idx]
+            # If it's on CPU, build its KV and insert at front (evict last to keep size)
+            elif forced_idx in cpu_chunks:
+                from build_kv_v2 import build_chunk_sequence
+                text = cpu_chunks.get(forced_idx, "")
+                if text:
+                    input_ids = build_chunk_sequence(text, tokenizer)
+                    current_input = torch.tensor([input_ids], device=device)
+                    with torch.inference_mode():
+                        outputs = model(current_input, use_cache=True, return_dict=True)
+                    kv = outputs.past_key_values
+                    gpu_chunks[forced_idx] = kv
+                    # Maintain max size (keep same number of chunks)
+                    max_size = len(current_gpu_chunks)
+                    current_gpu_chunks = [forced_idx] + [c for c in current_gpu_chunks if c != forced_idx]
+                    # Trim if we exceeded size
+                    if len(current_gpu_chunks) > max_size:
+                        current_gpu_chunks = current_gpu_chunks[:max_size]
+        except Exception:
+            pass
     print(f"[AsyncGeneration] Initial GPU chunks: {current_gpu_chunks}")
     print(f"[AsyncGeneration] Total GPU chunks: {len(current_gpu_chunks)}")
     print(f"[AsyncGeneration] Total CPU chunks: {len(cpu_chunks)}")
@@ -281,9 +311,14 @@ def async_generate_with_kv(
 
     chunk_seq_len = combined_kv[0][0].shape[2]
 
-    # Prepare question input
+    # Prepare question input (dataset-specific formatting if provided)
     question = sample.get("question", "")
-    formatted_question = QUERY_PROMPT + question
+    if dataset_name:
+        _, query_prompt, answer_format = get_prompt_for_dataset(dataset_name)
+        formatted_question = query_prompt + question + answer_format
+    
+    else:
+        formatted_question = QUERY_PROMPT + question + ANSWER_FORMAT_PROMPT
     question_ids = tokenizer.encode(formatted_question, add_special_tokens=False)
     question_input = torch.tensor([question_ids], device=device)
     question_length = len(question_ids)
@@ -292,6 +327,8 @@ def async_generate_with_kv(
     position_ids = torch.arange(chunk_seq_len, chunk_seq_len + question_length, device=device).unsqueeze(0)
 
     print(f"[AsyncGeneration] Context: {chunk_seq_len} + {question_length} = {total_context_len} tokens")
+    is_passkey = bool(dataset_name and "passkey" in str(dataset_name).lower())
+    decode_temperature = 0.0 if is_passkey else 0.1
 
     generated_tokens = []
     trace = []
@@ -309,7 +346,7 @@ def async_generate_with_kv(
         )
 
         past_key_values = outputs.past_key_values
-        next_token = sample_with_temperature(outputs.logits, temperature=0.1)  # Lower for factual accuracy
+        next_token = sample_with_temperature(outputs.logits, temperature=decode_temperature)
         token_id = next_token.item()
 
         # TTFT measured here
@@ -323,8 +360,9 @@ def async_generate_with_kv(
             generated_tokens.append(token_id)
             trace.append({"step": 0, "token": token_id, "chunks_used": current_gpu_chunks.copy()})
 
+        warmup_steps = 0
         # Initialize scheduler AFTER first token (not during TTFT)
-        if cpu_chunks:
+        if cpu_chunks and not disable_swaps:
             print(f"\n[AsyncGeneration] Initializing async scheduler after first token...")
             scheduler.initialize(
                 sample=sample,
@@ -336,6 +374,11 @@ def async_generate_with_kv(
                 max_gpu=len(gpu_chunks)
             )
             scheduler_initialized = True
+            scheduler.max_prefetched_gpu = max(scheduler.max_prefetched_gpu, scheduler.promote_per_step * 3)
+            scheduler.next_prefetch_steps = {1}  # Kick off predictions immediately
+            warmup_steps = max(0, prefetch_warmup_steps)
+            # Track ALL predicted chunks across steps
+            scheduler.all_predicted = set()
             
             # Show initial chunk rewards/scores
             print(f"[AsyncGeneration] Initial chunk rewards after initialization:")
@@ -343,19 +386,26 @@ def async_generate_with_kv(
                 sorted_rewards = sorted(scheduler.rewards.items(), key=lambda x: x[1], reverse=True)
                 for chunk_idx, reward in sorted_rewards:
                     location = "GPU" if chunk_idx in gpu_chunks else "CPU"
-                    print(f"[AsyncGeneration]   Chunk {chunk_idx} ({location}): reward={reward:.4f}")
+                    # print(f"[AsyncGeneration]   Chunk {chunk_idx} ({location}): reward={reward:.4f}")
             print()
         else:
             scheduler_initialized = False
-            print(f"[AsyncGeneration] No CPU chunks - all chunks fit on GPU, no swapping needed\n")
+            if disable_swaps:
+                print(f"[AsyncGeneration] Swaps disabled for test - keeping initial GPU chunks fixed\n")
+            else:
+                print(f"[AsyncGeneration] No CPU chunks - all chunks fit on GPU, no swapping needed\n")
 
         # ASYNC GENERATION LOOP
         transfer_count = 0
         cache_swaps = 0
         prefetch_count = 0
 
-        for step in range(1, max_tokens):
-            if token_id == tokenizer.eos_token_id:
+        total_steps = max_tokens + warmup_steps
+
+        for step in range(1, total_steps):
+            is_warmup = scheduler_initialized and step <= warmup_steps
+
+            if token_id == tokenizer.eos_token_id and not is_warmup:
                 break
 
             step_start = time.perf_counter()
@@ -366,16 +416,15 @@ def async_generate_with_kv(
                 scheduler.retry_pending_prefetch()
                 
                 # Check if this step requires scheduling
-                should_schedule = step in scheduler.next_prefetch_steps
+                should_schedule = step in scheduler.next_prefetch_steps or is_warmup
                 if should_schedule:
                     prefetch_count += 1
                     print(f"\n[Step {step}] === PREDICTION & PREFETCH ===")
                     print(f"[Step {step}] Triggering background prefetch #{prefetch_count}")
 
-                    print(scheduler.scheduler_interval)
-                    
                     # Get predicted chunks before calling schedule_if_needed
-                    future_step = step + scheduler.scheduler_interval
+                    # Predict EVERY step: use next step, but ensure threshold for predictor
+                    future_step = max(8, step + 1)
                     predicted_chunks = scheduler.predict_chunks(future_step, generated_tokens)
                     
                     # Show predicted chunks with their priorities (reward + exploration_bonus + recency)
@@ -399,7 +448,13 @@ def async_generate_with_kv(
                             bonus = priority - reward
                             print(f"[Step {step}]   {marker} Chunk {chunk_idx} ({location}): reward={reward:.4f}, priority={priority:.4f} (bonus={bonus:+.4f})")
                     
-                scheduler.schedule_if_needed(step, generated_tokens)
+                    # Accumulate ALL predictions and prefetch (no replacement)
+                    for chunk_idx in predicted_chunks:
+                        scheduler.all_predicted.add(chunk_idx)
+                        if chunk_idx not in gpu_chunks:
+                            scheduler.prefetch_chunks_async(chunk_idx)
+                    # Schedule next prefetch window (every step)
+                    scheduler.next_prefetch_steps = {step + 1}
 
             # NON-BLOCKING CHECK: See if any prefetched chunks are ready
             if scheduler_initialized:
@@ -436,7 +491,8 @@ def async_generate_with_kv(
                 available_set = set(available_chunks)
                 new_chunks = available_set - current_set
                 
-                if new_chunks and step % scheduler.scheduler_interval == 0:
+                # Swap only every 3rd step
+                if new_chunks and (step % 3 == 0):
                     print(f"\n{'='*80}")
                     print(f"[Step {step}] ASYNC SCHEDULING CHECKPOINT")
                     print(f"{'='*80}")
@@ -444,20 +500,23 @@ def async_generate_with_kv(
                     print(f"[Step {step}] Available chunks (prefetched): {available_chunks}")
                     print(f"[Step {step}] New chunks ready: {list(new_chunks)}")
                     
-                    # CRITICAL FIX: Check if new chunks are from predictions (prefetched)
-                    # These should be FORCED into GPU since we predicted them
-                    with scheduler.prefetch_lock:
-                        predicted_and_ready = [c for c in new_chunks if c in scheduler.prefetched]
+                    # Use ALL accumulated predictions that are READY now
+                    all_pred = list(getattr(scheduler, "all_predicted", set()))
+                    predicted_ready = [c for c in all_pred if c in available_chunks and c not in current_gpu_chunks]
+                    max_force = 5
+                    predicted_forced = predicted_ready[:max_force]
+
+                    protected_chunks = scheduler.get_protected_chunks()
                     
                     # Show rewards for all available chunks
-                    print(f"\n[Step {step}] Chunk Selection (by reward):")
+                    # print(f"\n[Step {step}] Chunk Selection (by reward):")
                     available_with_rewards = [(chunk_idx, scheduler.rewards.get(chunk_idx, 0.0)) for chunk_idx in available_chunks]
                     available_with_rewards.sort(key=lambda x: x[1], reverse=True)
                     
                     for chunk_idx, reward in available_with_rewards:
                         in_current = "✓" if chunk_idx in current_gpu_chunks else " "
                         is_new = "NEW" if chunk_idx in new_chunks else ""
-                        is_predicted = "★PREDICTED" if chunk_idx in predicted_and_ready else ""
+                        is_predicted = "★PREDICTED" if chunk_idx in getattr(scheduler, "all_predicted", set()) else ""
                         print(f"[Step {step}]   {in_current} Chunk {chunk_idx}: reward={reward:.4f} {is_new} {is_predicted}")
                     
                     # DECISION: Should we swap?
@@ -465,15 +524,28 @@ def async_generate_with_kv(
                     new_gpu_order = current_gpu_chunks  # Default: keep current
                     
                     # CASE 1: If predicted chunks are ready, ALWAYS swap them in!
-                    if predicted_and_ready:
+                    if predicted_forced:
                         should_swap = True
-                        print(f"\n[Step {step}] PREDICTED CHUNKS READY: Forcing swap for {predicted_and_ready}")
-                        # Keep some current chunks, add predicted chunks
-                        num_to_keep = max(0, scheduler.max_gpu - len(predicted_and_ready))
-                        best_current = sorted(current_gpu_chunks, 
-                                            key=lambda x: scheduler.rewards.get(x, 0.0), reverse=True)
-                        new_gpu_order = predicted_and_ready + best_current[:num_to_keep]
+                        print(f"\n[Step {step}] All accumulated predictions: {getattr(scheduler, 'all_predicted', set())}")
+                        print(f"[Step {step}] FORCING swap for: {predicted_forced}")
+                        # Keep previously protected chunks on the GPU
+                        protected_candidates = [chunk for chunk in current_gpu_chunks if chunk in protected_chunks and chunk not in predicted_forced]
+                        max_protected = max(0, scheduler.max_gpu - len(predicted_forced))
+                        protected_current = protected_candidates[:max_protected]
+                        # Remaining slots after reserving space for predicted + protected
+                        remaining_slots = max(0, scheduler.max_gpu - len(predicted_forced) - len(protected_current))
+                        remaining_candidates = [
+                            chunk for chunk in current_gpu_chunks
+                            if chunk not in predicted_forced and chunk not in protected_current
+                        ]
+                        remaining_sorted = sorted(
+                            remaining_candidates,
+                            key=lambda x: scheduler.rewards.get(x, 0.0),
+                            reverse=True
+                        )
+                        new_gpu_order = predicted_forced + protected_current + remaining_sorted[:remaining_slots]
                         new_gpu_order = new_gpu_order[:scheduler.max_gpu]  # Trim to max_gpu
+                        scheduler.protect_chunks(predicted_forced)
                     else:
                         print(f"\n[Step {step}] No predicted chunks ready yet (still in pending_prefetch)")
                         print(f"[Step {step}] Pending: {list(scheduler.pending_prefetch)}")
@@ -496,11 +568,21 @@ def async_generate_with_kv(
                         print(f"[Step {step}] ASYNC CACHE SWAP #{cache_swaps}")
                         
                         # Show if this was a predicted swap
-                        if predicted_and_ready and any(c in predicted_and_ready for c in chunks_to_use):
-                            print(f"[Step {step}] ✓ This swap includes PREDICTED chunks: {[c for c in chunks_to_use if c in predicted_and_ready]}")
+                        if predicted_forced and any(c in predicted_forced for c in chunks_to_use):
+                            print(f"[Step {step}] ✓ This swap includes PREDICTED chunks: {[c for c in chunks_to_use if c in predicted_forced]}")
                         
                         # Build new KV cache with available chunks
                         updated_gpu_chunks = scheduler.get_gpu_chunks()
+                        # Ensure selected predicted chunks are actually transferred.
+                        # If still in-flight, block briefly to finalize transfer.
+                        need_sync = [c for c in new_gpu_order if c not in updated_gpu_chunks and hasattr(scheduler, "prefetched") and c in scheduler.prefetched]
+                        for c in need_sync:
+                            try:
+                                gpu_kv = scheduler.force_sync_chunk(c)
+                                if gpu_kv is not None:
+                                    updated_gpu_chunks[c] = gpu_kv
+                            except Exception:
+                                pass
                         
                         # Try to build new cache
                         new_combined_kv, new_cache_info = EnhancedFastKVCacheManager.fast_concatenate_chunks_with_real_sparsity(
@@ -514,6 +596,19 @@ def async_generate_with_kv(
                             combined_kv = new_combined_kv
                             current_gpu_chunks = new_gpu_order
                             print(f"[Step {step}] ✓ GPU chunks now: {current_gpu_chunks}")
+                            # Commit GPU order to free evicted chunk memory and avoid OOM
+                            scheduler.commit_gpu_order(current_gpu_chunks)
+                            # Remove successful predictions from the accumulator
+                            for c in list(predicted_forced):
+                                if c in current_gpu_chunks:
+                                    try:
+                                        scheduler.all_predicted.discard(c)
+                                    except Exception:
+                                        pass
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
                             
                             # Quick context rebuild
                             pruned_len = combined_kv[0][0].shape[2]
@@ -529,9 +624,10 @@ def async_generate_with_kv(
                                 return_dict=True
                             )
                             
-                            # Minimal token replay
+                            # Replay recent tokens to stabilize logits after swap
                             if generated_tokens:
-                                recent_tokens = generated_tokens[-1:]
+                                replay_len = 10 if is_passkey else 3
+                                recent_tokens = generated_tokens[-replay_len:]
                                 prev_tokens = torch.tensor([recent_tokens], device=device)
                                 replay_outputs = model(
                                     input_ids=prev_tokens,
@@ -551,6 +647,9 @@ def async_generate_with_kv(
                     print(f"{'='*80}\n")
 
             # Generate next token (fast path)
+            if is_warmup:
+                continue
+
             input_token = next_token.unsqueeze(-1)
             outputs = model(
                 input_ids=input_token,
@@ -560,16 +659,31 @@ def async_generate_with_kv(
             )
 
             past_key_values = outputs.past_key_values
-            next_token = sample_with_temperature(outputs.logits, temperature=0.1)  # Lower for factual accuracy
+            next_token = sample_with_temperature(outputs.logits, temperature=decode_temperature)
             token_id = next_token.item()
 
             if token_id == tokenizer.eos_token_id:
                 break
 
             generated_tokens.append(token_id)
+            # Early stopping for passkey: stop after first complete answer
+            if is_passkey and len(generated_tokens) >= 3:
+                # Check if we hit newline (answer complete)
+                if token_id == tokenizer.encode('\n')[1]:  # Newline token
+                    break
+                # Or check if recent tokens are all digits (passkey complete)
+                if len(generated_tokens) >= 5:
+                    recent_text = tokenizer.decode(generated_tokens[-5:], skip_special_tokens=True)
+                    # If we have 5+ digit string, stop
+                    if recent_text.strip().isdigit() and len(recent_text.strip()) >= 5:
+                        break
+
             step_end = time.perf_counter()
             decode_times.append(step_end - step_start)
             trace.append({"step": step, "token": token_id, "chunks_used": current_gpu_chunks.copy()})
+
+            if len(generated_tokens) >= max_tokens:
+                break
 
             # Update rewards less frequently (but more often than before since interval is shorter)
             if scheduler_initialized and step % (scheduler.scheduler_interval * 3) == 0:
@@ -651,6 +765,10 @@ def run_async_pipeline(
     device: str = "cuda:0",
     sparsity_ratio: float = 1.0,
     gpu_memory_limit_gb: float = 40.0,
+    prefetch_warmup_steps: int = 0,
+    test_force_chunk: Optional[int] = None,
+    test_no_swaps: bool = False,
+    test_first_only: bool = False,
 
 ):
     print(f"[AsyncPipeline] Sparsity ratio: {sparsity_ratio:.2f}")
@@ -675,6 +793,8 @@ def run_async_pipeline(
 
     # Load samples
     samples = load_samples(input_file)
+    if test_first_only and samples:
+        samples = samples[:1]
     print(f"[AsyncPipeline] Loaded {len(samples)} samples")
 
     # # Setup retrieval
@@ -701,16 +821,33 @@ def run_async_pipeline(
     for si, sample in enumerate(tqdm(samples, desc="Processing", unit="sample")):
         try:
             print(f"\n[Sample {si}] Processing with async prefetch...")
+
+            if "passkey" in input_file.lower():
+                scheduler_interval = 1   # Predict every step
+                epsilon = 0.05          # Much lower exploration (5% instead of 20%)
+                promote_per_step = 4   # Swap more aggressively
+                max_candidates = 25     # Consider more chunks
+            else:
+                scheduler_interval = 3
+                epsilon = 0.15
+                promote_per_step = 2
+                max_candidates = 8
+
             scheduler = AsyncPrefetchScheduler(
                 device=device,
-                scheduler_interval=3,  # Check for swaps every 10 steps
-                promote_per_step=2,     # Prefetch 2 chunks at a time (more aggressive)
+                scheduler_interval=scheduler_interval,  # Check for swaps every 10 steps
+                promote_per_step=promote_per_step,     # Prefetch 2 chunks at a time (more aggressive)
                 exploration_c=1.2,
-                max_candidates=8,
+                max_candidates=max_candidates,
                 sparsity_ratio=sparsity_ratio,
-                epsilon=0.2             # 20% random exploration in chunk prediction
+                epsilon=epsilon             # 20% random exploration in chunk prediction
             )
             print(f"[AsyncPipeline] Created async scheduler")
+            # Allow more concurrent prefetched GPU caches to speed up warm transfers
+            try:
+                scheduler.max_prefetched_gpu = max(getattr(scheduler, "max_prefetched_gpu", 2), scheduler.promote_per_step * 4, 8)
+            except Exception:
+                pass
 
             torch.cuda.empty_cache()
 
@@ -755,7 +892,11 @@ def run_async_pipeline(
                 tokenizer=tokenizer,
                 device=device,
                 max_tokens=max_tokens,
-                sparsity_ratio=sparsity_ratio
+                sparsity_ratio=sparsity_ratio,
+                disable_swaps=test_no_swaps,
+                initial_force_chunk=test_force_chunk,
+                prefetch_warmup_steps=prefetch_warmup_steps,
+                dataset_name="passkey"
             )
 
             result["sample_id"] = str(sample.get("id", f"sample_{si}"))
@@ -860,6 +1001,10 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="Device")
     parser.add_argument("--sparsity_ratio", type=float, default=1.0, help="Sparsity ratio")
     parser.add_argument("--gpu-memory-limit", type=float, default=40.0, help="GPU memory limit in GB (default: 40)")
+    parser.add_argument("--prefetch_warmup_steps", type=int, default=0, help="Number of prefetch-only warmup steps before decoding")
+    parser.add_argument("--test_force_chunk", type=int, default=None, help="Force this chunk index into initial GPU set (testing)")
+    parser.add_argument("--test_no_swaps", action="store_true", help="Disable swaps (testing)")
+    parser.add_argument("--test_first_only", action="store_true", help="Process only first sample (testing)")
 
     args = parser.parse_args()
 
@@ -871,7 +1016,11 @@ def main():
         max_tokens=args.max_tokens,
         device=args.device,
         sparsity_ratio=args.sparsity_ratio,
-        gpu_memory_limit_gb=args.gpu_memory_limit
+        gpu_memory_limit_gb=args.gpu_memory_limit,
+        prefetch_warmup_steps=args.prefetch_warmup_steps,
+        test_force_chunk=args.test_force_chunk,
+        test_no_swaps=args.test_no_swaps,
+        test_first_only=args.test_first_only
     )
 
 if __name__ == "__main__":
